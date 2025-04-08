@@ -1,5 +1,6 @@
 import numpy as np
 import collections
+from nonlinear import newton
 
 CALC_TYPE = np.float64
 
@@ -17,13 +18,14 @@ class ButcherTable:
         assert len(A.shape) == 2
         assert (A.shape[0] == b.shape[0])
         assert (c.shape[0] == b.shape[0])
-        assert c[0] == 0
 
     def get_s(self):
         return len(self.b)
 
-class RKSolver:    
+class RKSolver:
     def __init__(self, btable, h):
+        assert RKSolver.method_is_supported(btable)
+
         self.btable = btable
         self.h = float(h)
         self.nsteps = 0
@@ -32,6 +34,19 @@ class RKSolver:
         self.t = None
         self.y = None
         self.k = None
+
+    # Check if method is supported.
+    # To be supported, method has to be
+    # explicit or diagonally implicit
+    @staticmethod
+    def method_is_supported(btable):
+        s = btable.get_s()
+        for i in range(s):
+            for j in range(i + 1, s):
+                if btable.A[i][j] != 0:
+                    return False
+        return True
+
 
     def init_problem(self, func, t0, y0):
         self.func = func
@@ -53,13 +68,21 @@ class RKSolver:
         b = self.btable.b
 
         self.k[:] = 0
-        self.k[0] = f(y, t)
-        for i in range(1, self.btable.get_s()):
+        for i in range(self.btable.get_s()):
             conv = np.zeros((len(y)))
             for j in range(i):
                 conv += a[i][j] * self.k[j]
+            
+            y1 = y + h * conv
+            t1 = t + c[i] * h
 
-            self.k[i] = f(y + h * conv, t + c[i]*h)
+            f_impl = f(y1, t1)
+            
+            if a[i][i] == 0:
+                self.k[i] = f_impl
+            else:
+                F = lambda k: f(y1 + h * a[i][i] * k, t1) - k
+                self.k[i] = newton(F, None, f_impl)
 
         self.t += h
         self.y += h * np.dot(self.k.T, b)
@@ -229,6 +252,52 @@ class RungeKuttaCollection:
         
         btable = ButcherTable(A, b, c)
         return RKSolver(btable, h)
+    
+    # Creates implicit 1-staged 1-order solver
+    # (Backward Euler method)
+    # Butcher table:
+    #  1 | 1 |
+    # --------
+    #    | 1 |
+    @staticmethod
+    def create_i1(h):
+        c = np.array([1])
+        b = np.array([1])
+        A = np.array([[1]])
+        btable = ButcherTable(A, b, c)
+        return RKSolver(btable, h)
+    
+    # Creates implicit 1-staged 2-order solver
+    # Butcher table:
+    #  1/2 | 1/2 |
+    # ------------
+    #      |  1  |
+    @staticmethod
+    def create_i2(h):
+        c = np.array([1/2])
+        b = np.array([1])
+        A = np.array([[1/2]])
+        btable = ButcherTable(A, b, c)
+        return RKSolver(btable, h)
+    
+    # Creates implicit 2-staged 3-order solver
+    # Butcher table:
+    #  1/2 + a | 1/2 + a |    0    |
+    #  1/2 - a |   -2a   | 1/2 + a |
+    # ------------------------------
+    #          |   1/2   |   1/2   |
+    # where a = sqrt(3)/6      
+    @staticmethod
+    def create_i3(h):
+        a = np.sqrt(3) / 6
+
+        c = np.array([1/2 + a, 1/2 - a])
+        b = np.array([1/2, 1/2])
+        A = np.array([[1/2 + a,     0  ],
+                      [  -2*a,  1/2 + a]])
+        btable = ButcherTable(A, b, c)
+        return RKSolver(btable, h)
+
 
 class AdamsCollection:
     # Creates explicit 1-order Adams method solver
