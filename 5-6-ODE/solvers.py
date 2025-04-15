@@ -1,6 +1,6 @@
 import numpy as np
 import collections
-from nonlinear import newton
+from nonlinear import newton, _jacob
 
 CALC_TYPE = np.float64
 
@@ -30,7 +30,6 @@ class RKSolver:
         self.h = float(h)
         self.nsteps = 0
 
-        self.problem = None
         self.t = None
         self.y = None
         self.k = None
@@ -82,10 +81,82 @@ class RKSolver:
                 self.k[i] = f_impl
             else:
                 F = lambda k: f(y1 + h * a[i][i] * k, t1) - k
-                self.k[i] = newton(F, None, f_impl)
+                self.k[i] = newton(F, None, f_impl, self.h)
 
         self.t += h
         self.y += h * np.dot(self.k.T, b)
+
+        return ret
+    
+    def get_h(self): return self.h
+
+# CROS Solver, modified to integrate
+# non-autonomous systems
+class CROSSolver:
+    def __init__(self, h):
+        self.h = float(h)
+        self.func = None
+        self.t = None
+        self.y = None
+
+    def init_problem(self, func, t0, y0):
+        self.func = func
+        self.t = float(t0)
+        self.y = y0.astype(CALC_TYPE)
+
+    def step(self):
+        ret = self.t, self.y.copy()
+
+        J = _jacob(lambda x: self.func(x, self.t), self.y, self.h)
+        A = np.identity(len(self.y), dtype=CALC_TYPE) - self.h * J * (1 + 1j) / 2
+        
+        k = np.linalg.solve(A, self.func(self.y, self.t))
+        self.y += self.h * np.real(k)
+        self.t += self.h
+
+        return ret
+
+    def get_h(self): return self.h
+
+# Rosenbrock-type 3rd order ODE solver
+class Rbrk3Solver:
+    class Params:
+        a = 0.435866521508459
+        
+        p0 = a
+        p1 = 0.4782408332745185
+        p2 = 0.0858926452170225
+        
+        b10 = a
+        b20 = a
+        b21 = -2.116053335949811
+
+    def __init__(self, h):
+        self.h = float(h)
+        self.func = None
+        self.t = None
+        self.y = None
+
+    def init_problem(self, func, t0, y0):
+        self.func = func
+        self.t = float(t0)
+        self.y = y0.astype(CALC_TYPE)
+
+    def step(self):
+        ret = self.t, self.y.copy()
+
+        f = lambda x: self.func(x, self.t)
+
+        J = _jacob(f, self.y, self.h)
+        D = np.identity(len(self.y), dtype=CALC_TYPE) + self.Params.a * self.h * J
+        Di = np.linalg.inv(D)
+
+        k0 = self.h * Di @ f(self.y)
+        k1 = self.h * Di @ f(self.y + self.Params.b10 * k0)
+        k2 = self.h * Di @ f(self.y + self.Params.b20 * k0 + self.Params.b21 * k1)
+
+        self.y += self.Params.p0 * k0 + self.Params.p1 * k1 + self.Params.p2 * k2
+        self.t += self.h
 
         return ret
     
@@ -100,12 +171,27 @@ class RKSolver:
 # collections-based one. This would allow
 # using numpy vectorized instructions and
 # amortized O(1) queue pushing/popping.
+#
+# Optional params:
+#   aux_solver_producer: functor that produces auxilary
+#       one-step solver to evaluate first N points
+#       default: Explicit RK4
+#   start_subdivide: defines how the start site is subdivided into finer grid
+#       for example, if N = 5, h = 0.2, start_subdivide = 2, then
+#       auxilary solver will evalute 10 points with h = 0.1
 class MultiStepSolverBase:
-    def __init__(self, steps, h):
+    def __init__(self, steps, h, aux_solver_producer=None, start_subdivide=1):
         self.h = h
         self.steps = steps
         self.func = None
         self._ytfcache = collections.deque()
+        self.start_subdivide = int(start_subdivide)
+        self.aux_solver = None
+
+        if aux_solver_producer is None:
+            self.aux_solver = MultiStepSolverBase.__create_aux_solver
+        else:
+            self.aux_solver = aux_solver_producer
 
     def init_problem(self, func, t0, y0):
         self.func = func
@@ -114,12 +200,13 @@ class MultiStepSolverBase:
     # Using Runge-Kutta Method to
     # evaluate first N points
     def __start_site(self, t0, y0):
-        solver = MultiStepSolverBase.__create_aux_solver(self.h)
+        solver = self.aux_solver(self.h / self.start_subdivide)
         solver.init_problem(self.func, t0, y0)
 
-        for _ in range(self.steps):
+        for i in range(self.steps * self.start_subdivide):
             t, y = solver.step()
-            self._ytfcache.append((y, t, self.func(y, t)))
+            if (i % self.start_subdivide == 0):
+                self._ytfcache.append((y, t, self.func(y, t)))
     
 
     def __ytf_cache_at(self, i):
@@ -141,13 +228,16 @@ class MultiStepSolverBase:
 
 class AdamsSolver(MultiStepSolverBase):
     # coeffs - Adams method coefficients, left to right
-    def __init__(self, coeffs, h):
-        super().__init__(len(coeffs), h)
+    # y_{n + 1} = y_n + c_implicit*h*f_{n+1} + h(c[-1]*f_n + c[-2]*f_{n-1} + ...)
+    def __init__(self, coeffs, h, c_implicit=None, aux=None, sub=1):
+        super().__init__(len(coeffs), h, aux, sub)
         self.coeffs = np.array(coeffs).astype(CALC_TYPE)
+        self.c_implicit = c_implicit
     
     def step(self):
         ret = self._ytf_cache_tail() # oldest y, t, f
         y, t, _  = self._ytf_cache_head() # yn, tn, fn
+        yn = y.copy()    
 
         conv = np.zeros_like(y)
         for c, (_, __, f) in zip(self.coeffs, self._ytfcache):
@@ -156,6 +246,19 @@ class AdamsSolver(MultiStepSolverBase):
         y += self.h * conv
         t += self.h
 
+        # At this point
+        #   y = y_n + h(c[-1]*f_n + c[-2]*f_{n-1} + ...)
+        # which is the y_{n+1} for explicit method.
+        # If method is implicit, we need to solve
+        #   y_{n+1} = y + h*c_implicit*f(y_{n+1}, t_{n+1})
+        # where
+        #   f(y_{n+1}, t_{n+1}) ~ f(y_n, t_n + h) + o(1)
+
+        if (self.c_implicit is not None):
+            func = lambda yn1: y - yn1 + self.h*self.c_implicit*self.func(yn1, t)
+            appr = y + self.h * self.c_implicit * self.func(yn, t)
+            y = newton(func, None, appr, self.h)
+
         self._ytf_cache_update(y, t, self.func(y, t))
         
         return ret[1], ret[0]
@@ -163,22 +266,41 @@ class AdamsSolver(MultiStepSolverBase):
     def get_h(self): return self.h
 
 class BDFSolver(MultiStepSolverBase):
-    # Params define method
-    # y_{n+1} = A*h*f(y_n, t_n) + c_0*y_n + c_1*y_{n-1} + c_2*y_{n-2} + ...
-    def __init__(self, A, coeffs, h):
-        super().__init__(len(coeffs), h)
+    # Params define method according to "implicit" flag:
+    # implicit is False:
+    #   y_{n+1} = A*h*f(y_n, t_n) + c_0*y_n + c_1*y_{n-1} + c_2*y_{n-2} + ...
+    # implicit is True:
+    #   y_{n+1} = A*h*f(y_{n+1}, t_{n+1}) + c_0*y_n + c_1*y_{n-1} + c_2*y_{n-2} + ...
+    def __init__(self, A, coeffs, h, implicit=False, aux=None, sub=1):
+        super().__init__(len(coeffs), h, aux, sub)
         self.A = A
         self.coeffs = np.array(coeffs[::-1]).astype(CALC_TYPE)
-    
+        self.implicit = implicit
+
     def step(self):
         ret = self._ytf_cache_tail()
-        _, t, f = self._ytf_cache_head()
+        yn, t, f = self._ytf_cache_head()
+        t += self.h
 
-        y_new = self.A * self.h * f
+        conv = np.zeros_like(f)
         for c, (y, _, __) in zip(self.coeffs, self._ytfcache):
-            y_new += c * y
+            conv += c * y
 
-        self._ytf_cache_update(y_new, t + self.h, self.func(y_new, t + self.h))
+        y = conv
+        if self.implicit == False:
+            y += self.A * self.h * f
+        else:
+            # At this point,
+            #   y = c_0*y_n + c_1*y_{n-1} + c_2*y_{n-2} + ...
+            # To evaluate y_{n+1}, we need to solve
+            #   y_{n+1} = A * h * f(y_{n+1}, t_{n+1}) + y
+            # Which can be approximated with o(1) as
+            #   y_{n+1} ~ A * h * f(y_n, t_{n+1}) + y + o(1)
+            func = lambda yn1: y - yn1 + self.A * self.h * self.func(yn1, t)
+            appr = y + self.A * self.h * self.func(yn, t)
+            y = newton(func, None, appr, self.h)
+
+        self._ytf_cache_update(y, t, self.func(y, t))
         
         return ret[1], ret[0]
     
@@ -298,57 +420,113 @@ class RungeKuttaCollection:
         btable = ButcherTable(A, b, c)
         return RKSolver(btable, h)
 
-
 class AdamsCollection:
     # Creates explicit 1-order Adams method solver
-    # y_{n+1} = y_n + h*f_n
+    #   y_{n+1} = y_n + h*f_n
     @staticmethod
-    def create_e1(h):
+    def create_e1(h, aux=None, sub=1):
         coeffs = [1]
-        return AdamsSolver(coeffs, h)
+        return AdamsSolver(coeffs, h, None, aux, sub)
     
     # Creates explicit 2-order Adams method solver
-    # y_{n+1} = y_n + h * (-.5 * f_{n-1} + 1.5*f_n)
+    #   y_{n+1} = y_n + h * (-.5 * f_{n-1} + 1.5*f_n)
     @staticmethod
-    def create_e2(h):
+    def create_e2(h, aux=None, sub=1):
         coeffs = [-.5, 1.5]
-        return AdamsSolver(coeffs, h)
+        return AdamsSolver(coeffs, h, None, aux, sub)
     
     # Creates explicit 3-order Adams method solver
-    # y_{n+1} = y_n + h * ((5/12) * f_{n-2} + (-16/12)*f_{n-1} + (23/12)*f_n)
+    #   y_{n+1} = y_n + h * ((5/12) * f_{n-2} + (-16/12)*f_{n-1} + (23/12)*f_n)
     @staticmethod
-    def create_e3(h):
+    def create_e3(h, aux=None, sub=1):
         coeffs = [5/12, -16/12, 23/12]
-        return AdamsSolver(coeffs, h)
+        return AdamsSolver(coeffs, h, None, aux, sub)
     
     # Creates explicit 4-order Adams method solver
-    # y_{n+1} = y_n + h * ((-9/24)*f_{n-3} + (37/24) * f_{n-2} + (-59/24)*f_{n-1} + (55/24)*f_n)
+    #   y_{n+1} = y_n + h * ((-9/24)*f_{n-3} + (37/24) * f_{n-2} + (-59/24)*f_{n-1} + (55/24)*f_n)
     @staticmethod
-    def create_e4(h):
+    def create_e4(h, aux=None, sub=1):
         coeffs = [-9/24, 37/24, -59/24, 55/24]
-        return AdamsSolver(coeffs, h)
+        return AdamsSolver(coeffs, h, None, aux, sub)
+    
+    # Creates implicit 1-order Adams method solver
+    #   y_{n+1} = y_n + h * f_{n + 1}
+    @staticmethod
+    def create_i1(h, aux=None, sub=1):
+        coeffs = [0]
+        c_impl = 1
+        return AdamsSolver(coeffs, h, c_impl, aux, sub)
+    
+    # Creates implicit 2-order Adams method solver
+    #   y_{n+1} = y_n + h/2 * f_{n} + h/2 * f_{n+1}
+    @staticmethod
+    def create_i2(h, aux=None, sub=1):
+        coeffs = [1/2]
+        c_impl = 1/2
+        return AdamsSolver(coeffs, h, c_impl, aux, sub)
+    
+    # Creates implicit 3-order Adams method solver
+    #   y_{n+1} = y_n + h[(-1/12)*f_{n-1} + (8/12)*f_n] + h(5/12)f_{n+1}
+    @staticmethod
+    def create_i3(h, aux=None, sub=1):
+        coeffs = [-1/12, 8/12]
+        c_impl = 5/12
+        return AdamsSolver(coeffs, h, c_impl, aux, sub)
+    
+    # Creates implicit 4-order Adams method solver
+    #   y_{n+1} = y_n + h[(1/24)f_{n-2} + (-5/24)f_{n-1} + (19/24)f_n] + h(9/24)f_{n+1}
+    @staticmethod
+    def create_i4(h, aux=None, sub=1):
+        coeffs = [1/24, -5/24, 19/24]
+        c_impl = 9/24
+        return AdamsSolver(coeffs, h, c_impl, aux, sub)
+
 
 class BDFCollection:
     # Creates explicit 1-order BDF method
-    # y_{n+1} = 1*h*f(y_n, t_n) + 1 * y_n
+    #   y_{n+1} = 1*h*f(y_n, t_n) + 1 * y_n
     @staticmethod
-    def create_e1(h):
-        return BDFSolver(1, [1], h)
+    def create_e1(h, aux=None, sub=1):
+        return BDFSolver(1, [1], h, False, aux, sub)
     
     # Creates explicit 2-order BDF method
-    # y_{n+1} = 2h*f*(y_n, t_n) + 0 * y_n + 1 * y_{n-1}
+    #   y_{n+1} = 2h*f*(y_n, t_n) + 0 * y_n + 1 * y_{n-1}
     @staticmethod
-    def create_e2(h):
-        return BDFSolver(2, [0, 1], h)
+    def create_e2(h, aux=None, sub=1):
+        return BDFSolver(2, [0, 1], h, False, aux, sub)
     
     # Creates explicit 3-order BDF method
-    # y_{n+1} = 3h*f*(y_n, t_n) + (-3/2) * y_n + 3 * y_{n-1} + (-1/2)*y_{n-2}
+    #   y_{n+1} = 3h*f*(y_n, t_n) + (-3/2) * y_n + 3 * y_{n-1} + (-1/2)*y_{n-2}
     @staticmethod
-    def create_e3(h):
-        return BDFSolver(3, [-3/2, 3, -1/2], h)
+    def create_e3(h, aux=None, sub=1):
+        return BDFSolver(3, [-3/2, 3, -1/2], h, False, aux, sub)
     
     # Creates explicit 4-order BDF method
-    # y_{n+1} = 4h*f*(y_n, t_n) + (-10/3) * y_n + 6 * y_{n-1} + (-2)*y_{n-2} + (1/3)*y_{n-3}
+    #   y_{n+1} = 4h*f*(y_n, t_n) + (-10/3) * y_n + 6 * y_{n-1} + (-2)*y_{n-2} + (1/3)*y_{n-3}
     @staticmethod
-    def create_e4(h):
-        return BDFSolver(4, [-10/3, 6, -2, 1/3], h)
+    def create_e4(h, aux=None, sub=1):
+        return BDFSolver(4, [-10/3, 6, -2, 1/3], h, False, aux, sub)
+    
+    # Creates implicit 1-order BDF method
+    #   y_{n+1} = h*f_{n+1} + y_n
+    @staticmethod
+    def create_i1(h, aux=None, sub=1):
+        return BDFSolver(1, [1], h, True, aux, sub)
+    
+    # Creates implicit 2-order BDF method
+    #   y_{n+1} = (2/3)h*f_{n+1} + (4/3)y_n + (-1/3)y_{n-1}
+    @staticmethod
+    def create_i2(h, aux=None, sub=1):
+        return BDFSolver(2/3, [4/3, -1/3], h, True, aux, sub)
+    
+    # Creates implicit 3-order BDF method
+    #   y_{n+1} = (6/11)*h*f_{n+1} + (18/11)y_n + (-9/11)y_{n-1} + (2/11)y_{n-2}
+    @staticmethod
+    def create_i3(h, aux=None, sub=1):
+        return BDFSolver(6/11, [18/11, -9/11, 2/11], h, True, aux, sub)
+    
+    # Creates implicit 4-order BDF method
+    #   y_{n+1} = (12/25)h*f_{n+1} + (48/25)y_n + (-36/25)y_{n-1} + (16/25)y_{n-2} + (-3/25)y_{n-3}
+    @staticmethod
+    def create_i4(h, aux=None, sub=1):
+        return BDFSolver(12/25, [48/25, -36/25, 16/25, -3/25], h, True, aux, sub)
